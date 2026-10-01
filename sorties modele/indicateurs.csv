@@ -1,0 +1,6 @@
+indicateur;valeur
+Sinistres observés (test);11138
+Sinistres prévus (test);11053,0800283374
+Observé / prévu (test);1,00768292380448
+Gain de déviance, test (%);8,20007129229187
+Gain de déviance, apprentissage (%);8,10447182204798

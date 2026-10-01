@@ -1,0 +1,349 @@
+---
+title: "Modélisation de la fréquence de sinistres"
+author: "ATTUOMAN PRINCE JOSIAS KOFFI"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+library(data.table)
+library(MASS)
+library(knitr)
+set.seed(2026)
+```
+
+# 1. Données
+
+On part de la table nettoyée (une ligne par police). On veut expliquer `nb_sinistres`, un nombre de sinistres par police, observé sur une durée différente selon les contrats.
+
+```{r donnees}
+donnees <- fread("assurance_propre.csv", sep = ";", dec = ",", encoding = "UTF-8")
+
+qualitatives <- c("zone_densite", "carburant", "marque_vehicule", "region",
+                  grep("^tranche_", names(donnees), value = TRUE))
+
+kable(data.frame(polices = nrow(donnees),
+                 sinistres = sum(donnees$nb_sinistres),
+                 exposition = round(sum(donnees$exposition_annees)),
+                 frequence = round(sum(donnees$nb_sinistres) / sum(donnees$exposition_annees), 4)),
+      format.args = list(big.mark = " "))
+```
+
+Pour évaluer le modèle sur des données jamais vues, on met de côté 30 % des polices. Tous les choix qui suivent sont faits sur les 70 % restants.
+
+```{r tirage}
+tirage <- sample.int(nrow(donnees), size = round(0.7 * nrow(donnees)))
+appr <- donnees[tirage]
+test <- donnees[-tirage]
+
+for (v in qualitatives) {
+  f <- factor(appr[[v]])
+  modalite_ref <- names(which.max(tapply(appr$exposition_annees, f, sum)))
+  set(appr, j = v, value = relevel(f, ref = modalite_ref))
+  set(test, j = v, value = factor(test[[v]], levels = levels(appr[[v]])))
+}
+```
+
+
+
+
+
+
+
+# 2. Le modèle
+
+Comme on compte des sinistres sur des durées différentes, on utilise une régression de Poisson avec `log(exposition_annees)` en offset. Un contrat observé deux fois plus longtemps a donc deux fois plus de sinistres attendus, et les coefficients se lisent comme des effets multiplicatifs sur la fréquence annuelle.
+
+```{r formule}
+formule <- function(variables, avec_expo = FALSE) {
+  termes <- c(variables, if (avec_expo) "log(exposition_annees)", "offset(log(exposition_annees))")
+  as.formula(paste("nb_sinistres ~", paste(termes, collapse = " + ")))
+}
+```
+
+
+
+
+
+
+
+
+
+# 3. Choix des variables
+
+Les variables numériques sont prises en tranches, celles de l'exploration. Ça permet de garder les effets qui ne sont pas linéaires (par exemple les véhicules neufs).
+
+La zone et la densité disent presque la même chose, on n'en garde qu'une, celle avec le meilleur AIC.
+
+```{r densite}
+base <- c("tranche_age_conducteur", "tranche_age_vehicule", "tranche_bonus_malus")
+mod_zone <- glm(formule(c(base, "zone_densite")),    family = poisson, data = appr)
+mod_dens <- glm(formule(c(base, "tranche_densite")), family = poisson, data = appr)
+comp_densite <- data.frame(variable = c("zone_densite", "tranche_densite"),
+                           AIC = c(AIC(mod_zone), AIC(mod_dens)))
+kable(comp_densite, digits = 0, format.args = list(big.mark = " "))
+var_densite <- comp_densite$variable[which.min(comp_densite$AIC)]
+```
+
+On garde donc **`r var_densite`**.
+
+On ajoute ensuite la puissance, le carburant, la marque et la région, puis on retire chaque variable une par une pour voir ce que ça change (test du rapport de vraisemblance et AIC). On garde une variable si le test est significatif à 1 % et si l'AIC augmente quand on la retire.
+
+```{r selection}
+variables_testees <- c(base, var_densite, "tranche_puissance", "carburant",
+                       "marque_vehicule", "region")
+mod_complet <- glm(formule(variables_testees), family = poisson, data = appr)
+
+lrt <- as.data.frame(drop1(mod_complet, test = "Chisq"))
+lrt$variable <- rownames(lrt)
+lrt <- lrt[lrt$variable != "<none>", ]
+lrt$hausse_AIC <- lrt$AIC - AIC(mod_complet)
+lrt$gardee <- lrt[["Pr(>Chi)"]] < 0.01 & lrt$hausse_AIC > 0
+
+kable(lrt[, c("variable", "Df", "LRT", "Pr(>Chi)", "hausse_AIC", "gardee")],
+      digits = c(0, 0, 1, 4, 1, 0), row.names = FALSE)
+variables_finales <- lrt$variable[lrt$gardee]
+```
+
+Variables gardées : **`r paste(variables_finales, collapse = ", ")`**.
+
+
+
+
+
+
+
+
+# 4. Le modèle colle-t-il aux données ?
+
+Trois choses à regarder :
+
+- la surdispersion : en Poisson la variance doit être égale à la moyenne, un rapport de Pearson bien au-dessus de 1 dit le contraire ;
+- le nombre de polices sans sinistre, observé contre prévu ;
+- la durée d'observation : à l'exploration, la fréquence était nettement plus haute sur les expositions très courtes, alors que l'offset suppose qu'elle ne dépend pas de la durée. On teste donc `log(exposition)` comme variable en plus.
+
+On compare Poisson et binomiale négative, avec et sans ce terme, et on garde le plus petit AIC.
+
+```{r modeles}
+form_simple <- formule(variables_finales)
+form_expo   <- formule(variables_finales, avec_expo = TRUE)
+
+modeles <- list(
+  "Poisson"                     = glm(form_simple, family = poisson, data = appr),
+  "Poisson + log(expo)"         = glm(form_expo,   family = poisson, data = appr),
+  "Binomiale négative"          = glm.nb(form_simple, data = appr),
+  "Binom. négative + log(expo)" = glm.nb(form_expo,   data = appr)
+)
+
+dispersion <- function(m) sum(residuals(m, "pearson")^2) / m$df.residual
+zeros_prevus <- function(m) {
+  esperance <- fitted(m)
+  if (inherits(m, "negbin")) sum(dnbinom(0, size = m$theta, mu = esperance))
+  else sum(dpois(0, esperance))
+}
+
+bilan <- data.frame(modele = names(modeles),
+                    AIC = sapply(modeles, AIC),
+                    dispersion = sapply(modeles, dispersion),
+                    zeros_observes = sum(appr$nb_sinistres == 0),
+                    zeros_prevus = sapply(modeles, zeros_prevus),
+                    row.names = NULL)
+kable(bilan, digits = c(0, 0, 3, 0, 0), format.args = list(big.mark = " "))
+
+nom_choisi <- bilan$modele[which.min(bilan$AIC)]
+mod_final  <- modeles[[nom_choisi]]
+```
+
+Le modèle retenu est **`r nom_choisi`**.
+
+Rapport sinistres observés / prévus par durée d'exposition (proche de 1 si le modèle est bien calé) :
+
+```{r par_exposition}
+comparer <- function(m, donnees_m, variable) {
+  d <- copy(donnees_m)
+  d$prevu <- predict(m, newdata = d, type = "response")
+  res <- d[, .(observe = sum(nb_sinistres), prevu = sum(prevu)), by = variable]
+  setorderv(res, variable)
+  res
+}
+poisson_simple <- comparer(modeles[["Poisson"]], appr, "tranche_exposition")
+choisi         <- comparer(mod_final, appr, "tranche_exposition")
+
+par_exposition <- data.table(tranche_exposition = poisson_simple$tranche_exposition,
+                             observe = poisson_simple$observe,
+                             rapport_poisson = poisson_simple$observe / poisson_simple$prevu,
+                             rapport_choisi  = choisi$observe / choisi$prevu)
+kable(par_exposition, digits = 3, format.args = list(big.mark = " "))
+```
+
+
+
+
+
+
+
+
+
+
+# 5. Qualité de la prédiction sur le test
+
+```{r test}
+# on enlève les polices dont une modalité n'a jamais été vue à l'apprentissage
+n_test_avant <- nrow(test)
+for (v in intersect(variables_finales, qualitatives)) {
+  test <- test[!is.na(get(v))]
+}
+n_ecartes <- n_test_avant - nrow(test)
+
+test$nb_prevu <- predict(mod_final, newdata = test, type = "response")
+
+deviance_poisson <- function(y, prevu) 2 * sum(ifelse(y > 0, y * log(y / prevu), 0) - (y - prevu))
+freq_moyenne <- sum(appr$nb_sinistres) / sum(appr$exposition_annees)
+
+dev_test     <- deviance_poisson(test$nb_sinistres, test$nb_prevu)
+dev_nul_test <- deviance_poisson(test$nb_sinistres, freq_moyenne * test$exposition_annees)
+prevu_appr   <- predict(mod_final, newdata = appr, type = "response")
+dev_appr     <- deviance_poisson(appr$nb_sinistres, prevu_appr)
+dev_nul_appr <- deviance_poisson(appr$nb_sinistres, freq_moyenne * appr$exposition_annees)
+
+indicateurs <- data.table(
+  indicateur = c("Sinistres observés (test)", "Sinistres prévus (test)",
+                 "Observé / prévu (test)", "Gain de déviance, test (%)",
+                 "Gain de déviance, apprentissage (%)"),
+  valeur = c(sum(test$nb_sinistres), sum(test$nb_prevu),
+             sum(test$nb_sinistres) / sum(test$nb_prevu),
+             100 * (1 - dev_test / dev_nul_test), 100 * (1 - dev_appr / dev_nul_appr)))
+kable(indicateurs, digits = 3, format.args = list(big.mark = " "))
+```
+
+Le gain de déviance compare le modèle à une prédiction qui donnerait la même fréquence moyenne à tout le monde. S'il est proche sur l'apprentissage et sur le test, le modèle ne fait pas de surapprentissage. (`r n_ecartes` polices du test ont été écartées pour modalité inconnue.)
+
+Pour voir si le modèle classe bien les risques, on coupe le test en 10 groupes de même taille selon la fréquence prévue, et on compare avec la fréquence réellement observée.
+
+```{r groupes, fig.height=4.5, fig.width=7}
+test[, freq_prevue := nb_prevu / exposition_annees]
+test[, groupe := ceiling(10 * frank(freq_prevue, ties.method = "first") / .N)]
+
+par_groupe <- test[, .(polices = .N, exposition = sum(exposition_annees),
+                       observe = sum(nb_sinistres), prevu = sum(nb_prevu)),
+                   by = groupe][order(groupe)]
+par_groupe[, `:=`(freq_observee = observe / exposition, freq_prevue = prevu / exposition)]
+kable(par_groupe, digits = 4, format.args = list(big.mark = " "))
+
+plot(par_groupe$groupe, par_groupe$freq_observee, type = "b", pch = 16,
+     xlab = "Groupe de risque prévu (1 = faible, 10 = élevé)",
+     ylab = "Fréquence annuelle",
+     ylim = range(c(par_groupe$freq_observee, par_groupe$freq_prevue)))
+lines(par_groupe$groupe, par_groupe$freq_prevue, type = "b", pch = 17, lty = 2)
+legend("topleft", c("Observée", "Prévue"), pch = c(16, 17), lty = c(1, 2), bty = "n")
+```
+
+La fréquence observée du groupe le plus risqué est **`r round(par_groupe$freq_observee[10] / par_groupe$freq_observee[1], 1)` fois** celle du groupe le moins risqué.
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 6. Effet de chaque variable
+
+Les résultats sont donnés en rapport de fréquence par rapport à une modalité de référence, à autres caractéristiques égales : 1,50 veut dire 50 % de sinistres en plus, 0,80 veut dire 20 % en moins. L'intervalle est à 95 %.
+
+```{r effets}
+coefs  <- coef(mod_final)
+bornes <- confint.default(mod_final)
+effets <- data.table(terme = names(coefs), rapport = exp(coefs),
+                     ic_bas = exp(bornes[, 1]), ic_haut = exp(bornes[, 2]))
+effets <- effets[terme != "(Intercept)"]
+effets[, `:=`(variable = NA_character_, modalite = NA_character_)]
+
+vars_qualitatives <- intersect(variables_finales, qualitatives)
+for (v in vars_qualitatives) {
+  effets[startsWith(terme, v), `:=`(variable = v, modalite = substring(terme, nchar(v) + 1))]
+}
+effets[is.na(variable), `:=`(variable = "log(exposition)", modalite = "(coefficient)")]
+effets[, variation := sprintf("%+.0f %%", 100 * (rapport - 1))]
+
+references <- data.table(variable = vars_qualitatives,
+                         modalite_reference = sapply(vars_qualitatives,
+                           function(v) levels(droplevels(appr[[v]]))[1]))
+kable(references)
+kable(effets[, .(variable, modalite, rapport, ic_bas, ic_haut, variation)], digits = 3)
+```
+
+```{r plus_fort, include=FALSE}
+plus_fort <- effets[variable != "log(exposition)"][which.max(rapport)]
+```
+
+L'effet le plus fort est celui de la modalité **`r plus_fort$modalite`** (`r plus_fort$variable`) : la fréquence est multipliée par **`r round(plus_fort$rapport, 2)`** par rapport à la référence.
+
+
+
+
+
+
+
+# 7. Robustesse
+
+Deux choix du nettoyage restaient discutables : l'imputation par la médiane et la fusion des polices présentes sur plusieurs lignes. On refait le modèle sans les lignes imputées, puis sans les polices fusionnées, et on regarde si les rapports bougent.
+
+```{r robustesse}
+reajuster <- function(donnees_m) {
+  if (inherits(mod_final, "negbin")) glm.nb(formula(mod_final), data = donnees_m)
+  else glm(formula(mod_final), family = poisson, data = donnees_m)
+}
+rapports <- function(m) { x <- exp(coef(m)); x[names(x) != "(Intercept)"] }
+
+mod_sans_imputees <- reajuster(appr[ligne_imputee == FALSE])
+mod_sans_fusion   <- reajuster(appr[nb_lignes_sources == 1])
+
+comparaison <- data.table(coefficient = names(rapports(mod_final)), final = rapports(mod_final))
+comparaison[, `:=`(sans_imputees = rapports(mod_sans_imputees)[coefficient],
+                   sans_fusion   = rapports(mod_sans_fusion)[coefficient])]
+comparaison[, ecart_pct := 100 * pmax(abs(sans_imputees / final - 1),
+                                      abs(sans_fusion / final - 1), na.rm = TRUE)]
+kable(head(comparaison[order(-ecart_pct)], 10), digits = 3)
+```
+
+Le plus gros écart sur un rapport de fréquence est de **`r round(max(comparaison$ecart_pct, na.rm = TRUE), 1)` %**.
+
+
+
+
+
+
+
+
+# 8. Limites
+
+- On modélise la fréquence seulement, pas le coût des sinistres : on n'a donc pas de prime.
+- Le test est tiré au hasard, on ne vérifie pas la stabilité dans le temps (il n'y a pas de date dans les données).
+- 14 % des lignes ont au moins une valeur imputée par la médiane, surtout le bonus-malus (médiane à 50, la meilleure classe).
+- Les exclusions faites au nettoyage (expositions supérieures à 1, polices à plus de 5 sinistres) influencent le niveau de fréquence.
+- Un sinistre est un événement rare et en partie aléatoire : le gain de déviance reste modeste, le modèle sert surtout à classer les risques.
+
+```{r export, include=FALSE}
+dir.create("sorties_modele", showWarnings = FALSE)
+ecrire <- function(x, fichier) fwrite(x, file.path("sorties_modele", fichier), sep = ";", dec = ",")
+ecrire(effets, "coefficients_modele.csv")
+ecrire(test[, .(numero_police, nb_sinistres, exposition_annees, nb_prevu, freq_prevue, groupe)],
+       "predictions_test.csv")
+ecrire(par_groupe, "calibration_groupes.csv")
+ecrire(indicateurs, "indicateurs.csv")
+ecrire(par_exposition, "calibration_exposition.csv")
+```
+
+Les tables pour le tableau de bord Power BI sont exportées dans le dossier `sorties_modele/` (séparateur `;`, virgule décimale).
